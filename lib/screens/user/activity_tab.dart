@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:personaltrainer/widgets/step_counter_widget.dart';
 import 'package:personaltrainer/screens/user/exercise_detail_screen.dart';
-import 'package:personaltrainer/screens/user/program_detail_screen.dart'; // EKLENDİ
+import 'package:personaltrainer/screens/user/program_detail_screen.dart';
+import 'package:personaltrainer/widgets/step_counter_widget.dart';
 
 class ActivityTab extends StatefulWidget {
   final Map<String, dynamic> userData;
@@ -14,20 +14,45 @@ class ActivityTab extends StatefulWidget {
 
 class _ActivityTabState extends State<ActivityTab> {
   List<Map<String, dynamic>> ongoingPrograms = [];
+  int steps = 0;
+  int totalBurnedCalories = 0;
 
   @override
   void initState() {
     super.initState();
-    _loadOngoingPrograms();
+    _checkAndResetDailyCalories().then((_) {
+      _loadOngoingPrograms();
+      _calculateBurnedCalories();
+    });
+  }
+
+  Future<void> _checkAndResetDailyCalories() async {
+    final userId = widget.userData['uid'];
+    final userDocRef = FirebaseFirestore.instance.collection('users').doc(userId);
+    final userDoc = await userDocRef.get();
+
+    final now = DateTime.now().toUtc();
+    final today = DateTime(now.year, now.month, now.day);
+
+    Timestamp? lastResetTimestamp = userDoc.data()?['lastCaloriesResetDate'];
+    DateTime? lastResetDate = lastResetTimestamp?.toDate();
+
+    if (lastResetDate == null || lastResetDate.isBefore(today)) {
+      await userDocRef.update({
+        'caloriesBurned': 0,
+        'lastCaloriesResetDate': Timestamp.fromDate(today),
+      });
+
+      setState(() {
+        totalBurnedCalories = 0;
+      });
+    }
   }
 
   Future<void> _loadOngoingPrograms() async {
     final userId = widget.userData['uid'];
-    final userDoc =
-    await FirebaseFirestore.instance.collection('users').doc(userId).get();
-
+    final userDoc = await FirebaseFirestore.instance.collection('users').doc(userId).get();
     final List<dynamic> programs = userDoc.data()?['ongoingPrograms'] ?? [];
-
     setState(() {
       ongoingPrograms = List<Map<String, dynamic>>.from(programs);
     });
@@ -40,19 +65,52 @@ class _ActivityTabState extends State<ActivityTab> {
 
   Future<void> _removeProgram(String programIdToRemove) async {
     final userId = widget.userData['uid'];
-
     ongoingPrograms.removeWhere((p) => p['programId'] == programIdToRemove);
-
     await FirebaseFirestore.instance.collection('users').doc(userId).update({
       'ongoingPrograms': ongoingPrograms,
     });
-
     setState(() {});
+  }
+
+  Future<void> _calculateBurnedCalories() async {
+    final userId = widget.userData['uid'];
+    final now = DateTime.now().toUtc();
+    final todayStart = DateTime.utc(now.year, now.month, now.day);
+    final todayEnd = todayStart.add(const Duration(days: 1));
+
+    int burnedFromExercises = 0;
+
+    final querySnapshot = await FirebaseFirestore.instance
+        .collection('completed_exercises')
+        .where('userId', isEqualTo: userId)
+        .where('timestamp', isGreaterThanOrEqualTo: todayStart)
+        .where('timestamp', isLessThan: todayEnd)
+        .get();
+
+    for (var doc in querySnapshot.docs) {
+      final cal = doc['calories'];
+      burnedFromExercises += (cal is int) ? cal : (cal as num).toInt();
+    }
+
+    final userDoc = await FirebaseFirestore.instance.collection('users').doc(userId).get();
+    int stepCount = userDoc['stepsToday'] ?? 0;
+    double caloriesPerStep = 0.04;
+    int stepCalories = (stepCount * caloriesPerStep).round();
+
+    int total = burnedFromExercises + stepCalories;
+
+    await FirebaseFirestore.instance.collection('users').doc(userId).update({
+      'caloriesBurned': total,
+    });
+
+    setState(() {
+      totalBurnedCalories = total;
+      steps = stepCount;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    final int dailyCalories = widget.userData['dailyCalories'] ?? 0;
     final List<dynamic> favoriteExerciseIds = widget.userData['favoriteExercises'] ?? [];
 
     return Padding(
@@ -63,13 +121,13 @@ class _ActivityTabState extends State<ActivityTab> {
           _buildCard(
             icon: Icons.directions_walk,
             title: "Bugünkü Adım Sayısı",
-            customWidget: const StepCounterWidget(),
+            customWidget: StepCounterWidget(),
           ),
           const SizedBox(height: 10),
           _buildCard(
             icon: Icons.local_fire_department,
             title: "Günlük Yakılan Kalori",
-            value: "$dailyCalories kcal",
+            value: "$totalBurnedCalories kcal",
           ),
           const SizedBox(height: 20),
           const Text("Devam Eden Programlar", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
@@ -183,11 +241,7 @@ class _ActivityTabState extends State<ActivityTab> {
               children: [
                 Text(title, style: const TextStyle(fontSize: 16)),
                 const SizedBox(height: 4),
-                customWidget ??
-                    Text(
-                      value ?? "",
-                      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                    ),
+                customWidget ?? Text(value ?? "", style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
               ],
             )
           ],

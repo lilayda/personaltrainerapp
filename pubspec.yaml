@@ -39,6 +39,8 @@ dependencies:
   intl: ^0.18.1
   fl_chart: ^0.64.0
   pedometer: ^4.0.1
+  video_player: ^2.7.0
+  shared_preferences: ^2.2.2
   permission_handler: ^11.0.1
 
 
@@ -68,6 +70,7 @@ flutter:
     - assets/images/programs/
     - assets/gifs/
     - assets/images/exercisecovers/
+    - assets/videos/
 
   # To add assets to your application, add an assets section, like this:
   # assets:

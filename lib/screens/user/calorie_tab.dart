@@ -1,3 +1,4 @@
+
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:fl_chart/fl_chart.dart';
@@ -25,13 +26,17 @@ class CalorieTab extends StatefulWidget {
 }
 
 class _CalorieTabState extends State<CalorieTab> {
+  final _formKey = GlobalKey<FormState>();
+
   final TextEditingController _weightController = TextEditingController();
   final TextEditingController _heightController = TextEditingController();
   final TextEditingController _targetWeightController = TextEditingController();
   final TextEditingController _queryController = TextEditingController();
+  final TextEditingController _targetCaloriesController = TextEditingController();
 
-  late int calories;
+  int caloriesToday = 0;
   late int goal;
+  bool _isAdminUser = false;
 
   @override
   void initState() {
@@ -39,37 +44,81 @@ class _CalorieTabState extends State<CalorieTab> {
     _weightController.text = widget.userData['weight'].toString();
     _heightController.text = widget.userData['height'].toString();
     _targetWeightController.text = widget.userData['targetWeight'].toString();
-
-    calories = widget.userData['caloriesToday'] ?? 0;
+    _targetCaloriesController.text = widget.userData['targetCalories'].toString();
     goal = widget.userData['targetCalories'] ?? 0;
+    _checkAndResetCalories();
+    _checkAdmin();
   }
 
-  @override
-  void dispose() {
-    _weightController.dispose();
-    _heightController.dispose();
-    _targetWeightController.dispose();
-    _queryController.dispose();
-    super.dispose();
+  Future<void> _checkAdmin() async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    final doc = await FirebaseFirestore.instance.collection('users').doc(uid).get();
+    setState(() {
+      _isAdminUser = doc.data()?['role'] == 'admin';
+    });
+  }
+
+  Future<void> _checkAndResetCalories() async {
+    final userRef = FirebaseFirestore.instance.collection('users').doc(widget.userData['uid']);
+    final snapshot = await userRef.get();
+    final data = snapshot.data();
+
+    Timestamp? lastReset = data?['lastCalorieReset'];
+    DateTime now = DateTime.now().toUtc();
+    DateTime today = DateTime.utc(now.year, now.month, now.day);
+
+    if (lastReset == null || lastReset.toDate().isBefore(today)) {
+      await userRef.update({
+        'caloriesToday': 0,
+        'lastCalorieReset': Timestamp.fromDate(today),
+      });
+      setState(() {
+        caloriesToday = 0;
+      });
+
+      final startOfDay = today;
+      final endOfDay = startOfDay.add(const Duration(days: 1));
+
+      final mealsSnapshot = await FirebaseFirestore.instance
+          .collection('today_meals')
+          .where('userId', isEqualTo: widget.userData['uid'])
+          .where('timestamp', isGreaterThanOrEqualTo: Timestamp.fromDate(startOfDay))
+          .where('timestamp', isLessThan: Timestamp.fromDate(endOfDay))
+          .get();
+
+      for (var doc in mealsSnapshot.docs) {
+        await doc.reference.delete();
+      }
+    } else {
+      setState(() {
+        caloriesToday = data?['caloriesToday'] ?? 0;
+      });
+    }
   }
 
   Future<void> _updateUserInfo() async {
+    if (!_formKey.currentState!.validate()) return;
+
     final userRef = FirebaseFirestore.instance.collection('users').doc(widget.userData['uid']);
 
-    int newWeight = int.tryParse(_weightController.text) ?? 0;
-    int newHeight = int.tryParse(_heightController.text) ?? 0;
-    int newTargetWeight = int.tryParse(_targetWeightController.text) ?? 0;
+    int newWeight = int.parse(_weightController.text);
+    int newHeight = int.parse(_heightController.text);
+    int newTargetWeight = int.parse(_targetWeightController.text);
+    int newTargetCalories = int.parse(_targetCaloriesController.text);
 
     await userRef.update({
       'weight': newWeight,
       'height': newHeight,
       'targetWeight': newTargetWeight,
+      'targetCalories': newTargetCalories,
       'weightHistory': FieldValue.arrayUnion([
-        {
-          'date': Timestamp.now(),
-          'weight': newWeight,
-        }
+        {'date': Timestamp.now(), 'weight': newWeight}
       ])
+    });
+
+    setState(() {
+      goal = newTargetCalories;
     });
 
     widget.onRefresh();
@@ -109,7 +158,7 @@ class _CalorieTabState extends State<CalorieTab> {
         context: context,
         builder: (_) => AlertDialog(
           title: const Text("Yemek Bulunamadı"),
-          content: Text("“${_queryController.text}” adlı yemek bulunamadı."),
+          content: Text('"' + _queryController.text + '" adlı yemek bulunamadı.'),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(context),
@@ -121,17 +170,119 @@ class _CalorieTabState extends State<CalorieTab> {
     }
   }
 
-  Future<bool> _isAdmin() async {
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) return false;
-    final doc = await FirebaseFirestore.instance.collection('users').doc(uid).get();
-    return doc.data()?['role'] == 'admin';
+  Widget _buildFormField(String label, TextEditingController controller, String unit, int min, int max) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: TextFormField(
+        controller: controller,
+        keyboardType: TextInputType.number,
+        decoration: InputDecoration(
+          labelText: label,
+          suffixText: unit,
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+        ),
+        validator: (value) {
+          if (value == null || value.isEmpty) return '$label giriniz';
+          final v = int.tryParse(value);
+          if (v == null) return 'Geçerli bir sayı giriniz';
+          if (v < min || v > max) return '$label $min - $max $unit aralığında olmalı';
+          return null;
+        },
+      ),
+    );
+  }
+
+  Widget _buildWeightChart(List<FlSpot> spots, double targetWeight, double height) {
+    double currentWeight = spots.isNotEmpty ? spots.last.y : 0;
+    double initialWeight = spots.isNotEmpty ? spots.first.y : 0;
+    double givenWeight = (initialWeight - currentWeight).clamp(0, double.infinity);
+    double bmi = height != 0 ? currentWeight / ((height / 100) * (height / 100)) : 0;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          height: 200,
+          child: spots.length < 2
+              ? const Center(child: Text("Grafik için en az 2 veri noktası gerekli"))
+              : LineChart(
+            LineChartData(
+              minY: (spots.map((e) => e.y).reduce((a, b) => a < b ? a : b) - 2).clamp(0, 100),
+              maxY: spots.map((e) => e.y).reduce((a, b) => a > b ? a : b) + 2,
+              titlesData: FlTitlesData(
+                bottomTitles: AxisTitles(
+                  sideTitles: SideTitles(
+                    showTitles: true,
+                    getTitlesWidget: (value, meta) {
+                      final date = DateTime.fromMillisecondsSinceEpoch(value.toInt());
+                      return Text(DateFormat('MM/dd').format(date), style: const TextStyle(fontSize: 10));
+                    },
+                    interval: 3 * 24 * 60 * 60 * 1000,
+                  ),
+                ),
+                leftTitles: AxisTitles(
+                  sideTitles: SideTitles(showTitles: true, reservedSize: 32),
+                ),
+                topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+              ),
+              lineBarsData: [
+                LineChartBarData(
+                  spots: spots,
+                  isCurved: true,
+                  color: Colors.teal,
+                  barWidth: 2,
+                  dotData: FlDotData(show: true),
+                ),
+                LineChartBarData(
+                  spots: spots.map((e) => FlSpot(e.x, targetWeight)).toList(),
+                  isCurved: false,
+                  color: Colors.green,
+                  barWidth: 1,
+                  isStrokeCapRound: true,
+                  dashArray: [5, 5],
+                  dotData: FlDotData(show: false),
+                ),
+              ],
+              gridData: FlGridData(show: true),
+              borderData: FlBorderData(show: true),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: [
+            _infoBox("Mevcut Kilo", "${currentWeight.toStringAsFixed(1)} kg"),
+            _infoBox("Hedef Kilo", "${targetWeight.toStringAsFixed(1)} kg"),
+            _infoBox("Verilen Kilo", "${givenWeight.toStringAsFixed(1)} kg"),
+            _infoBox("VKİ", bmi.toStringAsFixed(1)),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _infoBox(String label, String value) {
+    return Column(
+      children: [
+        Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
+        const SizedBox(height: 4),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.grey[200],
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Text(value, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+        ),
+      ],
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     List<dynamic> weightHistory = widget.userData['weightHistory'] ?? [];
-
     List<FlSpot> spots = weightHistory.map((entry) {
       final date = (entry['date'] as Timestamp).toDate();
       final xValue = date.millisecondsSinceEpoch.toDouble();
@@ -139,151 +290,88 @@ class _CalorieTabState extends State<CalorieTab> {
       return FlSpot(xValue, yValue);
     }).toList();
 
-    final double minY = spots.isNotEmpty
-        ? (spots.map((e) => e.y).reduce((a, b) => a < b ? a : b) - 5).clamp(0, double.infinity)
-        : 0;
-    final double maxY = spots.isNotEmpty
-        ? spots.map((e) => e.y).reduce((a, b) => a > b ? a : b) + 5
-        : 100;
-
     return SingleChildScrollView(
       padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text("Alınan Kalori: $calories / $goal", style: const TextStyle(fontSize: 16)),
-          const SizedBox(height: 6),
-          LinearProgressIndicator(
-            value: goal != 0 ? calories / goal : 0,
-            backgroundColor: Colors.grey[300],
-            color: calories > goal ? Colors.red : Colors.green,
-            minHeight: 12,
-          ),
-          const SizedBox(height: 20),
-          _buildFormField("Güncel Kilo", _weightController),
-          _buildFormField("Güncel Boy", _heightController),
-          _buildFormField("Hedef Kilo", _targetWeightController),
-          const SizedBox(height: 10),
-          Text("Yaş: ${widget.age}", style: const TextStyle(fontSize: 16)),
-          const SizedBox(height: 10),
-          ElevatedButton.icon(
-            onPressed: _updateUserInfo,
-            icon: const Icon(Icons.save),
-            label: const Text("Bilgileri Kaydet"),
-          ),
-          const SizedBox(height: 30),
-          const Text("Kilo Geçmişi", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 10),
-          SizedBox(
-            height: 200,
-            child: spots.length < 2
-                ? const Center(child: Text("Grafik için en az 2 veri noktası gerekli"))
-                : LineChart(LineChartData(
-              minY: minY,
-              maxY: maxY,
-              titlesData: FlTitlesData(
-                leftTitles: AxisTitles(
-                  sideTitles: SideTitles(showTitles: true, reservedSize: 32),
-                ),
-                bottomTitles: AxisTitles(
-                  sideTitles: SideTitles(
-                    showTitles: true,
-                    interval: 3 * 24 * 60 * 60 * 1000,
-                    getTitlesWidget: (value, meta) {
-                      final date = DateTime.fromMillisecondsSinceEpoch(value.toInt());
-                      final formatted = DateFormat('MM/dd').format(date);
-                      return Text(formatted, style: const TextStyle(fontSize: 10));
-                    },
-                  ),
-                ),
-                topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-              ),
-              borderData: FlBorderData(show: true),
-              lineBarsData: [
-                LineChartBarData(
-                  isCurved: true,
-                  spots: spots,
-                  color: Colors.purple,
-                  barWidth: 2,
-                  dotData: FlDotData(show: false),
-                ),
-              ],
-            )),
-          ),
-          const SizedBox(height: 30),
-          TextField(
-            controller: _queryController,
-            decoration: InputDecoration(
-              hintText: "Yemek adıyla kalori sorgula",
-              suffixIcon: IconButton(
-                icon: const Icon(Icons.search),
-                onPressed: _queryCalories,
-              ),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+      child: Form(
+        key: _formKey,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text("Alınan Kalori: $caloriesToday / $goal", style: const TextStyle(fontSize: 16)),
+            const SizedBox(height: 6),
+            LinearProgressIndicator(
+              value: goal != 0 ? caloriesToday / goal : 0,
+              backgroundColor: Colors.grey[300],
+              color: caloriesToday > goal ? Colors.red : Colors.green,
+              minHeight: 12,
             ),
-          ),
-          const SizedBox(height: 12),
-
-          // YENİ EKLENEN KISIM: SADECE ADMIN'LER İÇİN YEMEK EKLE BUTONU
-          FutureBuilder<bool>(
-            future: _isAdmin(),
-            builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.done && snapshot.data == true) {
-                return ElevatedButton.icon(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (_) => AddFoodScreen()),
-                    );
-                  },
-                  icon: const Icon(Icons.add),
-                  label: const Text("Yeni Yemek Ekle"),
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
-                );
-              }
-              return const SizedBox.shrink();
-            },
-          ),
-
-          const SizedBox(height: 8),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => FoodListPage(userId: widget.userData['uid']),
+            const SizedBox(height: 20),
+            _buildFormField("Güncel Kilo", _weightController, "kg", 20, 300),
+            _buildFormField("Güncel Boy", _heightController, "cm", 50, 250),
+            _buildFormField("Hedef Kilo", _targetWeightController, "kg", 20, 300),
+            _buildFormField("Hedef Kalori", _targetCaloriesController, "kcal", 500, 6000),
+            const SizedBox(height: 10),
+            Text("Yaş: ${widget.age}", style: const TextStyle(fontSize: 16)),
+            const SizedBox(height: 10),
+            ElevatedButton.icon(
+              onPressed: _updateUserInfo,
+              icon: const Icon(Icons.save),
+              label: const Text("Bilgileri Kaydet"),
+            ),
+            const SizedBox(height: 30),
+            const Text("Kilo Geçmişi", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            _buildWeightChart(spots, widget.userData['targetWeight']?.toDouble() ?? 0, widget.userData['height']?.toDouble() ?? 170),
+            const SizedBox(height: 30),
+            TextField(
+              controller: _queryController,
+              decoration: InputDecoration(
+                hintText: "Yemek adıyla kalori sorgula",
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.search),
+                  onPressed: _queryCalories,
                 ),
-              );
-            },
-            child: const Text("Yemek Ekle"),
-          ),
-          const SizedBox(height: 8),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => TodayMealsPage(userId: widget.userData['uid']),
-                ),
-              );
-            },
-            child: const Text("Bugün Yedikleriniz"),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildFormField(String label, TextEditingController controller) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: TextField(
-        controller: controller,
-        keyboardType: TextInputType.number,
-        decoration: InputDecoration(
-          labelText: label,
-          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (_isAdminUser)
+              ElevatedButton.icon(
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => AddFoodScreen()),
+                  );
+                },
+                icon: const Icon(Icons.add),
+                label: const Text("Yeni Yemek Ekle"),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+              ),
+            const SizedBox(height: 8),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => FoodListPage(userId: widget.userData['uid']),
+                  ),
+                ).then((_) => _checkAndResetCalories());
+              },
+              child: const Text("Yemek Ekle"),
+            ),
+            const SizedBox(height: 8),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => TodayMealsPage(userId: widget.userData['uid']),
+                  ),
+                ).then((_) => _checkAndResetCalories());
+              },
+              child: const Text("Bugün Yedikleriniz"),
+            ),
+          ],
         ),
       ),
     );

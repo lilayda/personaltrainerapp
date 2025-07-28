@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:video_player/video_player.dart';
 
 class ExerciseDetailScreen extends StatefulWidget {
   final String exerciseId;
@@ -28,13 +29,38 @@ class _ExerciseDetailScreenState extends State<ExerciseDetailScreen> {
 
   late Future<DocumentSnapshot> _exerciseFuture;
   bool isFavorite = false;
+  VideoPlayerController? _videoController;
 
   @override
   void initState() {
     super.initState();
-    _exerciseFuture =
-        _firestore.collection('exercises').doc(widget.exerciseId).get();
+
+    _exerciseFuture = _firestore.collection('exercises').doc(widget.exerciseId).get().then((snapshot) {
+      if (snapshot.exists) {
+        final data = snapshot.data();
+        final videoUrl = data?['gifUrl'];
+
+        if (videoUrl != null && videoUrl is String && videoUrl.isNotEmpty) {
+          _videoController = VideoPlayerController.asset(videoUrl)
+            ..initialize().then((_) {
+              setState(() {}); // initialize tamamlandı, UI'ı güncelle
+              _videoController!.play();
+            }).catchError((e) {
+              print("Video yükleme hatası: $e");
+            });
+        }
+      }
+      return snapshot;
+    });
+
     _checkIfFavorite();
+  }
+
+
+  @override
+  void dispose() {
+    _videoController?.dispose();
+    super.dispose();
   }
 
   Future<void> _checkIfFavorite() async {
@@ -85,24 +111,46 @@ class _ExerciseDetailScreenState extends State<ExerciseDetailScreen> {
           ),
         );
       } else {
-        // Program son egzersizi tamamladı
         final uid = _auth.currentUser?.uid;
         if (uid != null) {
           final userRef = _firestore.collection('users').doc(uid);
           final userDoc = await userRef.get();
           final data = userDoc.data();
 
+          final programDoc = await _firestore.collection('programs').doc(widget.programId).get();
+          final programData = programDoc.data();
+          final calories = programData?['caloriesBurned'] ?? 0;
+
+          await _firestore.collection('completed_exercises').add({
+            'userId': uid,
+            'exerciseId': widget.exerciseId,
+            'programId': widget.programId,
+            'calories': (calories is int) ? calories : (calories as num).toInt(),
+            'timestamp': DateTime.now().toUtc(),
+          });
+
           if (data != null && data['ongoingPrograms'] != null) {
             List<dynamic> ongoingPrograms = List.from(data['ongoingPrograms']);
+            final now = DateTime.now().toUtc();
+            final today = DateTime.utc(now.year, now.month, now.day);
+
             for (int i = 0; i < ongoingPrograms.length; i++) {
               if (ongoingPrograms[i]['programId'] == widget.programId) {
-                ongoingPrograms[i]['completedDays'] =
-                    (ongoingPrograms[i]['completedDays'] ?? 0) + 1;
+                Timestamp? lastDateTS = ongoingPrograms[i]['lastCompletedDate'];
+                DateTime? lastDate = lastDateTS?.toDate();
+
+                if (lastDate == null || lastDate.isBefore(today)) {
+                  ongoingPrograms[i]['completedDays'] =
+                      (ongoingPrograms[i]['completedDays'] ?? 0) + 1;
+                  ongoingPrograms[i]['lastCompletedDate'] =
+                      Timestamp.fromDate(today);
+                }
 
                 if (ongoingPrograms[i]['completedDays'] >=
                     (ongoingPrograms[i]['totalDays'] ?? 1)) {
                   ongoingPrograms.removeAt(i);
                 }
+
                 break;
               }
             }
@@ -165,15 +213,31 @@ class _ExerciseDetailScreenState extends State<ExerciseDetailScreen> {
           }
 
           var exercise = snapshot.data!.data() as Map<String, dynamic>;
+          final videoUrl = exercise['gifUrl'];
+
+          if (_videoController == null) {
+            _videoController = VideoPlayerController.network(videoUrl)
+              ..initialize().then((_) {
+                setState(() {});
+                _videoController!.setLooping(true);
+                _videoController!.play();
+              });
+          }
 
           return Stack(
             children: [
-              Image.asset(
-                exercise['gifUrl'],
-                fit: BoxFit.cover,
-                width: double.infinity,
-                height: double.infinity,
-              ),
+              _videoController != null && _videoController!.value.isInitialized
+                  ? SizedBox.expand(
+                child: FittedBox(
+                  fit: BoxFit.cover,
+                  child: SizedBox(
+                    width: _videoController!.value.size.width,
+                    height: _videoController!.value.size.height,
+                    child: VideoPlayer(_videoController!),
+                  ),
+                ),
+              )
+                  : const Center(child: CircularProgressIndicator()),
               Container(color: Colors.black.withOpacity(0.3)),
               Positioned(
                 top: 40,
